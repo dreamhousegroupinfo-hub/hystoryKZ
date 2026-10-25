@@ -1,0 +1,40 @@
+name: render
+
+on:
+  workflow_dispatch:
+    inputs:
+      job_id:
+        description: 'Job id (set by n8n)'
+        required: true
+        type: string
+      payload:
+        description: 'Render request JSON (set by n8n)'
+        required: true
+        type: string
+
+run-name: render ${{ inputs.job_id }}
+
+jobs:
+  render:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Install ffmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ffmpeg
+      - name: Render
+        env:
+          PAYLOAD: ${{ inputs.payload }}
+        run: node render.mjs
+      - uses: actions/upload-artifact@v4
+        with:
+          name: render-output
+          path: output/*
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
