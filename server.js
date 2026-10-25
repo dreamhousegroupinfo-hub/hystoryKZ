@@ -1,46 +1,19 @@
-// ─────────────────────────────────────────────────────────────────────────────
-// railway-github-ffmpeg
-//
-// Generic HTTP ffmpeg render service for the n8n "Scheduled and Manual Start"
-// block-based pipeline.
-//
-// NO Google authentication here. n8n lists the Drive folder itself and passes
-// PUBLIC download links; this service downloads each URL, runs a bash script,
-// and streams the produced output file straight back. n8n uploads it to Drive.
-//
-// Contract (node "Call Railway FFmpeg" for a block, and the assemble trigger):
-//   POST /render
-//   body: {
-//     topic_title?: string,                 // logging only
-//     files: [ { name, url }, ... ],        // downloaded into the work dir under `name`
-//     script?: string,                      // inline bash to write as run.sh and execute
-//     script_name?: string,                 // OR: name of a downloaded .sh file to run
-//     out?: string                          // output filename to stream back (default final.mp4)
-//   }
-//   -> response: the produced output file (Content-Type: video/mp4) as a binary body.
-//
-// If neither `script` nor `script_name` is given, it runs the newest downloaded *.sh.
-//
-// Auth (inbound, optional): set RENDER_TOKEN, send Authorization: Bearer <RENDER_TOKEN>.
-// ─────────────────────────────────────────────────────────────────────────────
-
 import express from 'express';
 import { spawn } from 'node:child_process';
 import { promises as fs, createReadStream, createWriteStream } from 'node:fs';
 import { pipeline } from 'node:stream/promises';
 import { Readable } from 'node:stream';
+import { randomUUID } from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
 
 const PORT = process.env.PORT || 8080;
 const RENDER_TOKEN = process.env.RENDER_TOKEN || '';
+const JOB_TTL_MS = 60 * 60 * 1000;
 
-// ── download a single public URL to a local path ─────────────────────────────
 async function downloadUrl(url, destPath) {
   const resp = await fetch(url, { redirect: 'follow' });
-  if (!resp.ok || !resp.body) {
-    throw new Error(`download failed (${resp.status}) for ${url}`);
-  }
+  if (!resp.ok || !resp.body) throw new Error(`download failed (${resp.status}) for ${url}`);
   const ctype = resp.headers.get('content-type') || '';
   if (ctype.includes('text/html')) {
     const html = await resp.text();
@@ -70,22 +43,46 @@ async function downloadUrl(url, destPath) {
   await pipeline(Readable.fromWeb(resp.body), createWriteStream(destPath));
 }
 
-// ── run a bash script ────────────────────────────────────────────────────────
 function runScript(scriptPath, cwd) {
   return new Promise((resolve, reject) => {
     const child = spawn('bash', [scriptPath], { cwd, env: process.env });
     let stderr = '';
     child.stdout.on('data', (d) => process.stdout.write(d));
-    child.stderr.on('data', (d) => {
-      stderr += d.toString();
-      process.stderr.write(d);
-    });
+    child.stderr.on('data', (d) => { stderr += d.toString(); process.stderr.write(d); });
     child.on('error', reject);
     child.on('close', (code) => {
       if (code === 0) resolve();
       else reject(new Error('render script exited with code ' + code + '\n' + stderr.slice(-4000)));
     });
   });
+}
+
+async function executeRender(body, work) {
+  const { topic_title, files, script, script_name, out } = body || {};
+  const outName = (out && /^[\w.\-]+$/.test(out)) ? out : 'final.mp4';
+  console.log(`[render] topic="${topic_title || ''}" files=${files.length} out=${outName} work=${work}`);
+  for (const f of files) {
+    if (!f || !f.name || !f.url) continue;
+    await downloadUrl(f.url, path.join(work, f.name));
+    console.log(`[render] downloaded ${f.name}`);
+  }
+  let scriptToRun;
+  if (typeof script === 'string' && script.trim()) {
+    scriptToRun = 'run.sh';
+    await fs.writeFile(path.join(work, scriptToRun), script, 'utf8');
+  } else if (script_name) {
+    scriptToRun = script_name;
+  } else {
+    const local = await fs.readdir(work);
+    const shFiles = local.filter((n) => /\.sh$/i.test(n)).sort();
+    scriptToRun = shFiles[shFiles.length - 1];
+  }
+  if (!scriptToRun) throw new Error('no script to run (provide script, script_name, or a .sh file)');
+  console.log(`[render] running ${scriptToRun}`);
+  await runScript(path.join(work, scriptToRun), work);
+  const finalPath = path.join(work, outName);
+  try { await fs.access(finalPath); } catch { throw new Error(`render finished but ${outName} was not produced`); }
+  return { finalPath, outName };
 }
 
 const app = express();
@@ -99,63 +96,86 @@ function checkAuth(req, res) {
   return false;
 }
 
-app.get('/', (_req, res) => res.json({ ok: true, service: 'railway-github-ffmpeg' }));
+app.get('/', (_req, res) => res.json({ ok: true, service: 'railway-github-ffmpeg', async_jobs: true }));
 app.get('/health', (_req, res) => res.json({ ok: true }));
 
-app.post('/render', async (req, res) => {
-  if (!checkAuth(req, res)) return;
+const jobs = new Map();
+function dropJob(job) {
+  jobs.delete(job.id);
+  if (job.work) fs.rm(job.work, { recursive: true, force: true }).catch(() => {});
+}
 
-  const { topic_title, files, script, script_name, out } = req.body || {};
-  if (!Array.isArray(files) || files.length === 0) {
+app.post('/jobs', async (req, res) => {
+  if (!checkAuth(req, res)) return;
+  const body = req.body || {};
+  if (!Array.isArray(body.files) || body.files.length === 0) {
     return res.status(400).json({ error: 'files[] is required (array of { name, url })' });
   }
-  const outName = (out && /^[\w.\-]+$/.test(out)) ? out : 'final.mp4';
+  const job = {
+    id: randomUUID(), status: 'running', error: null,
+    work: await fs.mkdtemp(path.join(os.tmpdir(), 'render-')),
+    finalPath: null, outName: null, created: Date.now(), waiters: [],
+  };
+  jobs.set(job.id, job);
+  setTimeout(() => dropJob(job), JOB_TTL_MS).unref();
 
-  const work = await fs.mkdtemp(path.join(os.tmpdir(), 'render-'));
-  console.log(`[render] topic="${topic_title || ''}" files=${files.length} out=${outName} work=${work}`);
+  executeRender(body, job.work)
+    .then(({ finalPath, outName }) => { job.finalPath = finalPath; job.outName = outName; job.status = 'done'; })
+    .catch((err) => { console.error('[render] error:', err); job.status = 'error'; job.error = err.message; })
+    .finally(() => { job.waiters.splice(0).forEach((fn) => fn()); });
 
+  res.status(202).json({ job_id: job.id, status: 'running' });
+});
+
+app.get('/jobs/:id', (req, res) => {
+  if (!checkAuth(req, res)) return;
+  const job = jobs.get(req.params.id);
+  if (!job) return res.status(404).json({ error: 'job not found (expired or server restarted)' });
+  const reply = () => res.json({ job_id: job.id, status: job.status, error: job.error });
+  const waitSec = Math.min(Math.max(Number(req.query.wait) || 0, 0), 100);
+  if (job.status !== 'running' || waitSec === 0) return reply();
+  let finished = false;
+  const done = () => { if (finished) return; finished = true; clearTimeout(timer); reply(); };
+  const timer = setTimeout(() => { job.waiters = job.waiters.filter((fn) => fn !== done); done(); }, waitSec * 1000);
+  job.waiters.push(done);
+  req.on('close', () => { finished = true; clearTimeout(timer); job.waiters = job.waiters.filter((fn) => fn !== done); });
+});
+
+app.get('/jobs/:id/file', async (req, res) => {
+  if (!checkAuth(req, res)) return;
+  const job = jobs.get(req.params.id);
+  if (!job) return res.status(404).json({ error: 'job not found' });
+  if (job.status !== 'done') return res.status(409).json({ error: 'job is ' + job.status, detail: job.error });
+  res.setHeader('Content-Type', 'video/mp4');
+  res.setHeader('Content-Disposition', `attachment; filename="${job.outName}"`);
   try {
-    for (const f of files) {
-      if (!f || !f.name || !f.url) continue;
-      await downloadUrl(f.url, path.join(work, f.name));
-      console.log(`[render] downloaded ${f.name}`);
-    }
+    await pipeline(createReadStream(job.finalPath), res);
+    setTimeout(() => dropJob(job), 10 * 60 * 1000).unref();
+  } catch (err) {
+    console.error('[render] stream error:', err);
+    if (!res.headersSent) res.status(500).json({ error: err.message }); else res.end();
+  }
+});
 
-    let scriptToRun;
-    if (typeof script === 'string' && script.trim()) {
-      scriptToRun = 'run.sh';
-      await fs.writeFile(path.join(work, scriptToRun), script, 'utf8');
-    } else if (script_name) {
-      scriptToRun = script_name;
-    } else {
-      const local = await fs.readdir(work);
-      const shFiles = local.filter((n) => /\.sh$/i.test(n)).sort();
-      scriptToRun = shFiles[shFiles.length - 1];
-    }
-    if (!scriptToRun) {
-      return res.status(422).json({ error: 'no script to run (provide script, script_name, or a .sh file)' });
-    }
-    console.log(`[render] running ${scriptToRun}`);
-    await runScript(path.join(work, scriptToRun), work);
-
-    const finalPath = path.join(work, outName);
-    try {
-      await fs.access(finalPath);
-    } catch {
-      return res.status(500).json({ error: `render finished but ${outName} was not produced` });
-    }
-
+// legacy synchronous endpoint
+app.post('/render', async (req, res) => {
+  if (!checkAuth(req, res)) return;
+  const body = req.body || {};
+  if (!Array.isArray(body.files) || body.files.length === 0) {
+    return res.status(400).json({ error: 'files[] is required (array of { name, url })' });
+  }
+  const work = await fs.mkdtemp(path.join(os.tmpdir(), 'render-'));
+  try {
+    const { finalPath, outName } = await executeRender(body, work);
     res.setHeader('Content-Type', 'video/mp4');
     res.setHeader('Content-Disposition', `attachment; filename="${outName}"`);
-    console.log(`[render] done -> streaming ${outName}`);
     await pipeline(createReadStream(finalPath), res);
   } catch (err) {
     console.error('[render] error:', err);
-    if (!res.headersSent) res.status(500).json({ error: err.message });
-    else res.end();
+    if (!res.headersSent) res.status(500).json({ error: err.message }); else res.end();
   } finally {
     fs.rm(work, { recursive: true, force: true }).catch(() => {});
   }
 });
 
-app.listen(PORT, () => console.log(`railway-github-ffmpeg listening on :${PORT}`));
+app.listen(PORT, () => console.log(`ffmpeg render service listening on :${PORT}`));
