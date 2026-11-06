@@ -13,7 +13,7 @@ on:
 
 jobs:
   render:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
@@ -21,14 +21,12 @@ jobs:
         with:
           node-version: 20
       - name: Install ffmpeg
-        timeout-minutes: 10
-        run: |
-          if command -v ffmpeg >/dev/null 2>&1; then
-            ffmpeg -version | head -n 1
-          else
-            sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 update
-            sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 install -y --no-install-recommends ffmpeg
-          fi
+        timeout-minutes: 4
+        uses: FedericoCarboni/setup-ffmpeg@v3
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Check ffmpeg
+        run: ffmpeg -version | head -n 1
       - name: Render
         env:
           PAYLOAD: ${{ inputs.payload }}
